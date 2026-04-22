@@ -1,24 +1,65 @@
 # squid-replication
 
-Monthly VX futures scraper and normalizer built with `uv`.
+Work in progress: this repo is actively being built out, and the replication notebook, strategy logic, and fit-to-paper results are still evolving.
 
-Clean parquet datasets are built with `pandas` and `pyarrow`.
+## What This Repo Is
 
-## What it downloads
+This repository is for replicating JungleRocks's whitepaper around the VIX term-structure signal behind the Squid family of strategies.
 
-- Archive monthly VX contract files from the Cboe settlement archive for contracts through `2013`
-- Current monthly VX contract files from the Cboe historical futures API for contracts from `2014+`
-- `cfevoloi.csv` for daily VX product-level volume and open interest
+Today the repo has two main pieces:
 
-Weekly VX contracts are ignored.
+- a local data pipeline that downloads and normalizes monthly VX futures history from Cboe
+- a notebook, `notebooks/signal_test.ipynb`, that walks through the whitepaper signal tests, proxy comparisons, base strategies, refined strategies, and parameter calibration
+
+The current workflow is:
+
+1. build the local VX datasets with the CLI
+2. open the notebook
+3. reproduce the paper's signal-section figures and tables using:
+   - official Cboe VX futures data
+   - official Cboe spot VIX history
+   - bundled `SPVXTSTR` history
+   - Yahoo `ES=F` and `SPY` as equity proxies
+
+## Current Status
+
+What is already implemented:
+
+- monthly VX futures download and cleaning
+- generic UX ladder construction (`UX1` through `UX7`)
+- dislocation-count signal generation
+- same-day and `t+1` bucket studies
+- bundled normalized `SPVXTSTR` history
+- base and refined Squid strategy weights
+- notebook plots and performance tables for the current replication pass
+
+What is still imperfect:
+
+- the equity leg is still proxy-based (`ES=F` and `SPY`), not a fully reconstructed historical ES roll series
+- some strategy details are still being calibrated against the paper
+- alternate PnL constructions are still being tested in the notebook
+
+## Data Sources
+
+The current notebook and pipeline use:
+
+- Cboe settlement archive and current historical futures API for monthly VX contracts
+- Cboe `cfevoloi.csv` for VX product-level volume and open interest
+- Cboe spot VIX history CSV
+- bundled `data/external/spvxtstr_normalized.csv`
+- Yahoo Finance for `ES=F` and `SPY`
 
 ## Setup
+
+Install dependencies with `uv`:
 
 ```bash
 uv sync
 ```
 
-## Run
+## Build The Local VX Datasets
+
+Generate the raw and clean VX datasets:
 
 ```bash
 uv run squid-replication
@@ -30,7 +71,7 @@ Optional refresh:
 uv run squid-replication --refresh
 ```
 
-Optional custom output directory:
+Optional custom data directory:
 
 ```bash
 uv run squid-replication --data-dir data
@@ -42,7 +83,36 @@ You can also run the module directly:
 uv run python -m squid_replication
 ```
 
-## Output layout
+The notebook expects the clean VX parquet outputs to exist locally, so run the pipeline at least once before opening the notebook.
+
+## Open The Notebook
+
+Start Jupyter:
+
+```bash
+uv run jupyter lab
+```
+
+Then open:
+
+```text
+notebooks/signal_test.ipynb
+```
+
+The notebook currently covers:
+
+- signal construction from the VX curve
+- term-structure snapshot plots
+- same-day and `t+1` bucket tests
+- `SPVXTSTR` comparison
+- base strategy curves and stats
+- refined strategy curves and stats
+- proxy comparison and threshold calibration
+- exported strategy weights
+
+## Generated Local Outputs
+
+Running the VX pipeline creates local datasets like:
 
 ```text
 data/
@@ -60,77 +130,68 @@ data/
       generic_contracts.parquet
 ```
 
-## Clean datasets
+The notebook also writes derived artifacts such as:
+
+```text
+data/derived/
+  strategy_weights.csv
+```
+
+These generated folders are gitignored because they can be rebuilt locally.
+
+## Clean VX Datasets
 
 `monthly_contracts.parquet`
 
-- `trade_date`
-- `contract_expiry`
-- `contract_code`
-- `contract_label`
-- `source`
-- `source_file`
-- `open`
-- `high`
-- `low`
-- `close`
-- `settle`
-- `change`
-- `total_volume`
-- `efp`
-- `open_interest`
+- one row per trade date per monthly VX contract
+- includes normalized OHLC, settle, volume, and open interest fields
 
-Monthly contract cleaning notes:
+Cleaning rules include:
 
-- Prices before `2007-03-26` are rescaled by `0.1` to normalize the CFE VX quote-scale change
-- Archive and current placeholder rows with all-zero prices, volume, and open interest are excluded
-- Rows with non-positive `settle` are excluded so the cleaned dataset remains settle-backtestable
+- pre-`2007-03-26` VX prices are rescaled by `0.1`
+- placeholder rows with all-zero prices and activity are removed
+- rows with non-positive `settle` are removed
 
 `product_daily.parquet`
 
-- `trade_date`
-- `vx_volume`
-- `vx_open_interest`
+- daily VX product-level volume and open interest
 
 `generic_contracts.parquet`
 
-- `trade_date`
-- `ux_symbol`
-- `ux_rank`
-- `contract_expiry`
-- `contract_code`
-- `contract_label`
-- `source`
-- `source_file`
-- `roll_trade_date`
-- `days_to_expiry`
-- `open`
-- `high`
-- `low`
-- `close`
-- `settle`
-- `change`
-- `total_volume`
-- `efp`
-- `open_interest`
-- `previous_contract_code`
-- `rolled_today`
-- `gross_return`
-- `transaction_cost`
-- `net_return`
-- `gross_index`
-- `net_index`
+- generic `UX1` through `UX7` ladder
+- roll metadata
+- roll-aware generic returns and indices
+- alternate `close_expiry_roll` and `settle_expiry_roll` levels for hold-through-expiry analysis
 
-Generic VX notes:
+Generic ladder behavior:
 
-- `UX1` through `UX7` are assigned by nearest eligible monthly expiry on each `trade_date`
-- A contract stops being eligible on the roll date, defined as `3` trading sessions before `contract_expiry`
-- On a roll date, the series is marked on the prior held contract's `settle` and then switches into the next contract at that same `settle`
-- `transaction_cost` is a fixed `0.0002` and is applied only when the series switches contracts
-- `gross_index` and `net_index` are settle-to-settle wealth indices built from those roll-aware returns
-- Later generics use staggered starts and begin once enough eligible months exist
+- `UX1` through `UX7` are assigned by monthly expiry offset from the front eligible contract
+- the default roll date is `3` trading sessions before expiry
+- `settle_expiry_roll` keeps a hold-through-expiry version of the ladder for signal work
+- `net_return` includes the fixed transaction-cost treatment used by the generic builder
+
+## Notebook Conventions
+
+The notebook currently separates signal generation from PnL construction.
+
+Examples:
+
+- the signal often uses `settle_expiry_roll`
+- VX PnL can be switched between generic `net_return` and alternate level-based experiments
+- `SPVXTSTR` is read from the bundled normalized file
+- the equity side is still tested through proxies
+
+Those choices are documented in the notebook itself and may continue to change while the replication is refined.
 
 ## Tests
+
+Run the full test suite with:
+
+```bash
+uv run pytest
+```
+
+Coverage run:
 
 ```bash
 uv run pytest --cov=squid_replication

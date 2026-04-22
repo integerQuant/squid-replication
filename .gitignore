@@ -4,5 +4,8 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+reference/
 data/raw/
 data/clean/
+data/derived/
+notebooks/.ipynb_checkpoints/
