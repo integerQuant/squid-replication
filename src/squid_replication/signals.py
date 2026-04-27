@@ -9,6 +9,9 @@ import pandas as pd
 DEFAULT_START = pd.Timestamp("2006-04-05")
 DEFAULT_END = pd.Timestamp("2025-12-31")
 DEFAULT_UX_SYMBOLS = tuple(f"UX{rank}" for rank in range(1, 8))
+DEFAULT_TRANSACTION_COST_BPS = 2.0
+DEFAULT_DISLOCATION_TIE_POLICY = "strict_lt"
+STABLE_DISLOCATION_TIE_POLICY = "stable_order"
 
 PERFECT_CONTANGO_BUCKET = "Perfect Contango (0)"
 LOW_DISLOCATION_BUCKET = "Low Dislocation (2-4)"
@@ -183,6 +186,49 @@ def build_generic_return_frame(
     return returns
 
 
+def build_available_contract_frame(
+    generic_frame: pd.DataFrame,
+    *,
+    value_field: str,
+    contract_positions: dict[str, int],
+    start: str | pd.Timestamp | None = DEFAULT_START,
+    end: str | pd.Timestamp | None = DEFAULT_END,
+) -> pd.DataFrame:
+    """Build a wide frame from the nth available listed contracts on each date."""
+    if not contract_positions:
+        return pd.DataFrame(index=pd.DatetimeIndex([], name="trade_date"))
+
+    invalid_positions = [position for position in contract_positions.values() if position < 1]
+    if invalid_positions:
+        raise ValueError("Contract positions must be positive integers.")
+
+    frame = generic_frame.copy()
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    frame["contract_expiry"] = pd.to_datetime(frame["contract_expiry"])
+    frame = frame.sort_values(["trade_date", "contract_expiry", "ux_rank", "ux_symbol"])
+    frame["available_position"] = frame.groupby("trade_date").cumcount() + 1
+
+    name_by_position = {
+        position: name for name, position in contract_positions.items()
+    }
+    selected = frame.loc[
+        frame["available_position"].isin(name_by_position),
+        ["trade_date", "available_position", value_field],
+    ].copy()
+    selected["contract_slot"] = selected["available_position"].map(name_by_position)
+
+    wide = (
+        selected.pivot(index="trade_date", columns="contract_slot", values=value_field)
+        .sort_index()
+        .reindex(columns=list(contract_positions))
+    )
+
+    if start is not None or end is not None:
+        wide = wide.loc[start:end]
+
+    return wide
+
+
 def build_return_frame_from_levels(level_frame: pd.DataFrame) -> pd.DataFrame:
     """Compute returns directly from a wide level frame without forward filling gaps."""
     levels = level_frame.apply(pd.to_numeric, errors="coerce")
@@ -221,6 +267,7 @@ def combine_weighted_returns(
     *,
     asset_weight_map: dict[str, str],
     name: str,
+    transaction_costs: pd.Series | None = None,
 ) -> pd.Series:
     """Combine aligned asset returns using explicit weight-column mappings."""
     aligned_returns = asset_returns.reindex(weights.index)
@@ -232,6 +279,11 @@ def combine_weighted_returns(
         weight_series = pd.to_numeric(weights[weight_column], errors="coerce")
         total_return = total_return.add(weight_series * asset_series, fill_value=np.nan)
         valid_mask &= asset_series.notna() & weight_series.notna()
+
+    if transaction_costs is not None:
+        cost_series = pd.to_numeric(transaction_costs.reindex(weights.index), errors="coerce")
+        total_return = total_return - cost_series
+        valid_mask &= cost_series.notna()
 
     total_return.loc[~valid_mask] = np.nan
     total_return.name = name
@@ -258,16 +310,52 @@ def build_drawdown_series(growth_index: pd.Series) -> pd.Series:
 
 
 def build_turnover_series(
-    weights: pd.DataFrame, *, weight_columns: Sequence[str]
+    weights: pd.DataFrame, *, weight_columns: Sequence[str], one_way: bool = True
 ) -> pd.Series:
-    """Compute one-way turnover as half the absolute change in target weights."""
+    """Compute turnover from absolute changes in target weights."""
     weight_frame = weights.loc[:, list(weight_columns)].apply(pd.to_numeric, errors="coerce")
-    turnover = 0.5 * weight_frame.diff().abs().sum(axis=1)
+    multiplier = 0.5 if one_way else 1.0
+    turnover = multiplier * weight_frame.diff().abs().sum(axis=1)
     valid_rows = weight_frame.notna().all(axis=1)
     prior_valid_rows = valid_rows.shift(1, fill_value=False)
     turnover.loc[~(valid_rows & prior_valid_rows)] = np.nan
     turnover.name = "turnover"
     return turnover
+
+
+def build_strategy_transaction_costs(
+    weights: pd.DataFrame,
+    *,
+    weight_columns: Sequence[str],
+    transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS,
+    roll_costs: pd.DataFrame | None = None,
+    roll_weight_map: dict[str, str] | None = None,
+) -> pd.Series:
+    """Estimate strategy costs from absolute rebalances and contract rolls."""
+    weight_frame = weights.loc[:, list(weight_columns)].apply(pd.to_numeric, errors="coerce")
+    valid_rows = weight_frame.notna().all(axis=1)
+    prior_valid_rows = valid_rows.shift(1, fill_value=False)
+    cost_rate = transaction_cost_bps / 10_000.0
+
+    rebalance_notional = weight_frame.diff().abs().sum(axis=1)
+    costs = rebalance_notional * cost_rate
+    costs.loc[valid_rows & ~prior_valid_rows] = 0.0
+    costs.loc[~valid_rows] = np.nan
+
+    if roll_costs is not None and roll_weight_map:
+        aligned_roll_costs = roll_costs.reindex(weight_frame.index).apply(
+            pd.to_numeric, errors="coerce"
+        )
+        roll_cost = pd.Series(0.0, index=weight_frame.index, dtype=float)
+        for roll_column, weight_column in roll_weight_map.items():
+            asset_roll_cost = aligned_roll_costs[roll_column].fillna(0.0)
+            asset_weight = weight_frame[weight_column].abs()
+            roll_cost = roll_cost + asset_weight * asset_roll_cost
+        costs = costs + roll_cost.where(valid_rows & prior_valid_rows, 0.0)
+
+    costs.loc[~valid_rows] = np.nan
+    costs.name = "transaction_cost"
+    return costs
 
 
 def summarize_performance(
@@ -294,10 +382,23 @@ def summarize_performance(
     growth_index = build_growth_index(series)
     drawdown = build_drawdown_series(growth_index)
     max_drawdown = drawdown.min()
-    sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility else np.nan
+
+    def invalid_ratio_denominator(value: float | pd.NA) -> bool:
+        if pd.isna(value):
+            return True
+        numeric_value = float(value)
+        return (not np.isfinite(numeric_value)) or np.isclose(numeric_value, 0.0)
+
+    if invalid_ratio_denominator(annualized_volatility):
+        sharpe_ratio = np.nan
+    else:
+        sharpe_ratio = annualized_return / annualized_volatility
 
     downside_deviation = np.sqrt((series.clip(upper=0) ** 2).mean()) * np.sqrt(annualization)
-    sortino_ratio = annualized_return / downside_deviation if downside_deviation else np.nan
+    if invalid_ratio_denominator(downside_deviation):
+        sortino_ratio = np.nan
+    else:
+        sortino_ratio = annualized_return / downside_deviation
     mean_turnover = pd.to_numeric(turnover, errors="coerce").mean() if turnover is not None else np.nan
 
     return pd.Series(
@@ -342,10 +443,24 @@ def build_term_structure(
     return curve
 
 
-def count_curve_dislocations(curve: pd.DataFrame) -> pd.Series:
-    """Count term-structure dislocations using the paper's strict-lt ranking rule."""
+def count_curve_dislocations(
+    curve: pd.DataFrame,
+    *,
+    tie_policy: str = DEFAULT_DISLOCATION_TIE_POLICY,
+) -> pd.Series:
+    """Count term-structure dislocations using the configured tie policy."""
     if curve.empty:
         return pd.Series(index=curve.index, dtype="Int64", name="dislocation_count")
+
+    valid_tie_policies = {
+        DEFAULT_DISLOCATION_TIE_POLICY,
+        STABLE_DISLOCATION_TIE_POLICY,
+    }
+    if tie_policy not in valid_tie_policies:
+        raise ValueError(
+            f"Unsupported tie policy {tie_policy!r}. Expected one of "
+            f"{sorted(valid_tie_policies)!r}."
+        )
 
     values = curve.to_numpy(dtype=float)
     dislocation_counts = np.full(len(curve), np.nan)
@@ -353,8 +468,16 @@ def count_curve_dislocations(curve: pd.DataFrame) -> pd.Series:
     valid_values = values[valid_rows]
 
     if len(valid_values) > 0:
-        lower_counts = (valid_values[:, None, :] < valid_values[:, :, None]).sum(axis=2)
-        expected_ranks = lower_counts + 1
+        if tie_policy == DEFAULT_DISLOCATION_TIE_POLICY:
+            lower_counts = (valid_values[:, None, :] < valid_values[:, :, None]).sum(axis=2)
+            expected_ranks = lower_counts + 1
+        else:
+            sorted_positions = np.argsort(valid_values, axis=1, kind="stable")
+            expected_ranks = np.empty_like(sorted_positions)
+            row_indices = np.arange(valid_values.shape[0])[:, None]
+            expected_ranks[row_indices, sorted_positions] = np.arange(
+                1, valid_values.shape[1] + 1
+            )
         canonical_ranks = np.arange(1, valid_values.shape[1] + 1)
         dislocation_counts[valid_rows] = (expected_ranks != canonical_ranks).sum(axis=1)
 
@@ -409,9 +532,10 @@ def build_daily_signal_frame(
     signal_curve: pd.DataFrame,
     *,
     vix_close: pd.Series | None = None,
+    tie_policy: str = DEFAULT_DISLOCATION_TIE_POLICY,
 ) -> pd.DataFrame:
     """Build the tradable daily signal set from the signal-generation UX curve."""
-    dislocation_count = count_curve_dislocations(signal_curve)
+    dislocation_count = count_curve_dislocations(signal_curve, tie_policy=tie_policy)
     signal_frame = pd.DataFrame(index=signal_curve.index)
     signal_frame["dislocation_count_raw"] = dislocation_count
     signal_frame["dislocation_bucket_raw"] = bucket_dislocations(dislocation_count)
@@ -433,9 +557,10 @@ def build_weekly_signal_frame(
     signal_curve: pd.DataFrame,
     *,
     vix_close: pd.Series | None = None,
+    tie_policy: str = DEFAULT_DISLOCATION_TIE_POLICY,
 ) -> pd.DataFrame:
     """Build the weekly signal set using previous-week averages."""
-    dislocation_count = count_curve_dislocations(signal_curve)
+    dislocation_count = count_curve_dislocations(signal_curve, tie_policy=tie_policy)
     slope_raw = compute_curve_slope(signal_curve)
 
     signal_frame = pd.DataFrame(index=signal_curve.index)
@@ -552,14 +677,18 @@ def build_refined_program_weights(
 
 
 __all__ = [
+    "DEFAULT_DISLOCATION_TIE_POLICY",
     "CBOE_VIX_HISTORY_URL",
     "DEFAULT_BUCKET_ORDER",
     "DEFAULT_END",
     "DEFAULT_START",
+    "DEFAULT_TRANSACTION_COST_BPS",
     "DEFAULT_UX_SYMBOLS",
     "HIGH_DISLOCATION_BUCKET",
     "LOW_DISLOCATION_BUCKET",
     "PERFECT_CONTANGO_BUCKET",
+    "STABLE_DISLOCATION_TIE_POLICY",
+    "build_available_contract_frame",
     "build_base_program_weights",
     "build_daily_signal_frame",
     "build_drawdown_series",
@@ -567,6 +696,7 @@ __all__ = [
     "build_growth_index",
     "build_refined_program_weights",
     "build_return_frame_from_levels",
+    "build_strategy_transaction_costs",
     "build_spvxtstr_program_weights",
     "build_term_structure",
     "build_turnover_series",

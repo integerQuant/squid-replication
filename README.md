@@ -167,7 +167,7 @@ Generic ladder behavior:
 
 - `UX1` through `UX7` are assigned by monthly expiry offset from the front eligible contract
 - the default roll date is `3` trading sessions before expiry
-- `settle_expiry_roll` keeps a hold-through-expiry version of the ladder for signal work
+- `close_expiry_roll` and `settle_expiry_roll` keep hold-through-expiry versions of the ladder for sensitivity checks
 - `net_return` includes the fixed transaction-cost treatment used by the generic builder
 
 ## Notebook Conventions
@@ -176,8 +176,9 @@ The notebook currently separates signal generation from PnL construction.
 
 Examples:
 
-- the signal often uses `settle_expiry_roll`
-- VX PnL can be switched between generic `net_return` and alternate level-based experiments
+- the paper-facing notebook default now uses `close` for the signal, plus stable tie handling in the dislocation count
+- the VX sleeve default uses generic `net_return` with the first and third available listed contracts for paper-style `UX1` and `UX3` exposure
+- VX PnL can still be switched to alternate level-based experiments
 - `SPVXTSTR` is read from the bundled normalized file
 - the equity side is still tested through proxies
 

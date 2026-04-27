@@ -195,6 +195,16 @@ def test_build_generic_contract_frame_supports_staggered_starts_and_roll_costs()
     None
 ):
     trade_dates = [date(2024, 1, day) for day in range(2, 17)]
+    expiries = [
+        date(2024, 1, 17),
+        date(2024, 2, 14),
+        date(2024, 3, 20),
+        date(2024, 4, 17),
+        date(2024, 5, 22),
+        date(2024, 6, 18),
+        date(2024, 7, 17),
+        date(2024, 8, 21),
+    ]
 
     def make_contract_rows(
         code: str,
@@ -228,14 +238,14 @@ def test_build_generic_contract_frame_supports_staggered_starts_and_roll_costs()
         return rows
 
     contract_rows: list[dict[str, object]] = []
-    contract_rows.extend(make_contract_rows("C1", trade_dates[6], 0, 7, 100.0))
-    contract_rows.extend(make_contract_rows("C2", trade_dates[7], 0, 8, 120.0))
-    contract_rows.extend(make_contract_rows("C3", trade_dates[8], 0, 9, 140.0))
-    contract_rows.extend(make_contract_rows("C4", trade_dates[9], 0, 10, 160.0))
-    contract_rows.extend(make_contract_rows("C5", trade_dates[10], 0, 11, 180.0))
-    contract_rows.extend(make_contract_rows("C6", trade_dates[11], 0, 12, 200.0))
-    contract_rows.extend(make_contract_rows("C7", trade_dates[12], 1, 13, 220.0))
-    contract_rows.extend(make_contract_rows("C8", trade_dates[13], 2, 14, 240.0))
+    contract_rows.extend(make_contract_rows("C1", expiries[0], 0, 7, 100.0))
+    contract_rows.extend(make_contract_rows("C2", expiries[1], 0, 8, 120.0))
+    contract_rows.extend(make_contract_rows("C3", expiries[2], 0, 9, 140.0))
+    contract_rows.extend(make_contract_rows("C4", expiries[3], 0, 10, 160.0))
+    contract_rows.extend(make_contract_rows("C5", expiries[4], 0, 11, 180.0))
+    contract_rows.extend(make_contract_rows("C6", expiries[5], 0, 12, 200.0))
+    contract_rows.extend(make_contract_rows("C7", expiries[6], 1, 13, 220.0))
+    contract_rows.extend(make_contract_rows("C8", expiries[7], 2, 14, 240.0))
 
     generic_frame = build_generic_contract_frame(pd.DataFrame(contract_rows))
 
@@ -306,6 +316,134 @@ def test_build_generic_contract_frame_supports_staggered_starts_and_roll_costs()
     assert ux1_next_roll_day["previous_contract_code"] == "C2"
     assert ux1_next_roll_day["rolled_today"] is True
     assert ux1_next_roll_day["gross_return"] == expected_post_roll_return
+
+
+def test_build_generic_contract_frame_adds_expiry_roll_level_series() -> None:
+    trade_dates = [date(2024, 1, day) for day in range(2, 14)]
+
+    def make_contract_rows(
+        code: str,
+        expiry: date,
+        active_trade_dates: list[date],
+        settle_base: float,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for offset, trade_date in enumerate(active_trade_dates):
+            settle = settle_base + offset
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "contract_expiry": expiry,
+                    "contract_code": code,
+                    "contract_label": code,
+                    "source": "synthetic",
+                    "source_file": f"{code}.csv",
+                    "open": settle,
+                    "high": settle,
+                    "low": settle,
+                    "close": settle + 0.5,
+                    "settle": settle,
+                    "change": None if offset == 0 else 1.0,
+                    "total_volume": 1_000,
+                    "efp": 0,
+                    "open_interest": 2_000,
+                }
+            )
+        return rows
+
+    contract_rows: list[dict[str, object]] = []
+    contract_rows.extend(
+        make_contract_rows("C1", date(2024, 1, 8), trade_dates[:7], 100.0)
+    )
+    contract_rows.extend(
+        make_contract_rows("C2", date(2024, 2, 14), trade_dates, 120.0)
+    )
+    contract_rows.extend(
+        make_contract_rows("C3", date(2024, 3, 20), trade_dates, 140.0)
+    )
+
+    generic_frame = build_generic_contract_frame(
+        pd.DataFrame(contract_rows), max_rank=2
+    )
+    by_key = generic_frame.set_index(["trade_date", "ux_symbol"])
+
+    assert by_key.loc[(trade_dates[2], "UX1"), "contract_code"] == "C1"
+    assert by_key.loc[(trade_dates[2], "UX1"), "settle"] == 102.0
+    assert by_key.loc[(trade_dates[2], "UX1"), "settle_expiry_roll"] == 102.0
+    assert by_key.loc[(trade_dates[2], "UX1"), "close_expiry_roll"] == 102.5
+
+    assert by_key.loc[(trade_dates[3], "UX1"), "contract_code"] == "C2"
+    assert by_key.loc[(trade_dates[3], "UX1"), "settle"] == 123.0
+    assert by_key.loc[(trade_dates[3], "UX1"), "settle_expiry_roll"] == 103.0
+    assert by_key.loc[(trade_dates[3], "UX1"), "close_expiry_roll"] == 103.5
+
+    assert by_key.loc[(trade_dates[3], "UX2"), "contract_code"] == "C3"
+    assert by_key.loc[(trade_dates[3], "UX2"), "settle"] == 143.0
+    assert by_key.loc[(trade_dates[3], "UX2"), "settle_expiry_roll"] == 123.0
+    assert by_key.loc[(trade_dates[3], "UX2"), "close_expiry_roll"] == 123.5
+
+    assert by_key.loc[(trade_dates[6], "UX1"), "contract_code"] == "C2"
+    assert by_key.loc[(trade_dates[6], "UX1"), "settle"] == 126.0
+    assert by_key.loc[(trade_dates[6], "UX1"), "settle_expiry_roll"] == 106.0
+    assert by_key.loc[(trade_dates[6], "UX1"), "close_expiry_roll"] == 106.5
+
+    assert by_key.loc[(trade_dates[7], "UX1"), "contract_code"] == "C2"
+    assert by_key.loc[(trade_dates[7], "UX1"), "settle"] == 127.0
+    assert by_key.loc[(trade_dates[7], "UX1"), "settle_expiry_roll"] == 127.0
+    assert by_key.loc[(trade_dates[7], "UX1"), "close_expiry_roll"] == 127.5
+
+
+def test_build_generic_contract_frame_preserves_missing_month_gaps() -> None:
+    trade_dates = [date(2024, 1, day) for day in range(2, 6)]
+
+    def make_contract_rows(
+        code: str,
+        expiry: date,
+        active_trade_dates: list[date],
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for offset, trade_date in enumerate(active_trade_dates):
+            settle = 100.0 + offset
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "contract_expiry": expiry,
+                    "contract_code": code,
+                    "contract_label": code,
+                    "source": "synthetic",
+                    "source_file": f"{code}.csv",
+                    "open": settle,
+                    "high": settle,
+                    "low": settle,
+                    "close": settle,
+                    "settle": settle,
+                    "change": None if offset == 0 else 1.0,
+                    "total_volume": 1_000,
+                    "efp": 0,
+                    "open_interest": 2_000,
+                }
+            )
+        return rows
+
+    contract_rows: list[dict[str, object]] = []
+    contract_rows.extend(make_contract_rows("F24", date(2024, 1, 17), trade_dates[:3]))
+    contract_rows.extend(make_contract_rows("H24", date(2024, 3, 20), trade_dates))
+
+    generic_frame = build_generic_contract_frame(
+        pd.DataFrame(contract_rows), max_rank=4, roll_trading_days=0
+    )
+
+    first_day = generic_frame.loc[
+        generic_frame["trade_date"] == trade_dates[0]
+    ].sort_values("ux_rank")
+    assert first_day["ux_symbol"].tolist() == ["UX1", "UX3"]
+    assert first_day["contract_code"].tolist() == ["F24", "H24"]
+
+    post_roll_day = generic_frame.loc[
+        generic_frame["trade_date"] == trade_dates[-2]
+    ].sort_values("ux_rank")
+    assert post_roll_day["ux_symbol"].tolist() == ["UX1"]
+    assert post_roll_day["contract_code"].tolist() == ["H24"]
 
 
 def test_parse_product_daily_csv_skips_disclaimer_and_selects_vx_columns() -> None:
@@ -438,6 +576,7 @@ Date,VOLATILITY INDEX VOLUME,VOLATILITY INDEX OI,Other
 
     contract_frame = pd.read_parquet(contract_clean)
     product_frame = pd.read_parquet(product_clean)
+    generic_frame = pd.read_parquet(generic_clean)
 
     assert parquet_date_list(contract_frame["contract_expiry"]) == [
         date(2013, 1, 16),
@@ -459,3 +598,5 @@ Date,VOLATILITY INDEX VOLUME,VOLATILITY INDEX OI,Other
     assert product_records == [
         {"trade_date": date(2004, 3, 26), "vx_volume": 461, "vx_open_interest": 368}
     ]
+    assert "settle_expiry_roll" in generic_frame.columns
+    assert "close_expiry_roll" in generic_frame.columns

@@ -7,6 +7,7 @@ import pytest
 
 from squid_replication.signals import (
     DEFAULT_BUCKET_ORDER,
+    build_available_contract_frame,
     build_base_program_weights,
     build_drawdown_series,
     build_daily_signal_frame,
@@ -14,6 +15,7 @@ from squid_replication.signals import (
     build_growth_index,
     build_refined_program_weights,
     build_return_frame_from_levels,
+    build_strategy_transaction_costs,
     build_spvxtstr_program_weights,
     build_term_structure,
     build_turnover_series,
@@ -103,6 +105,22 @@ def test_count_curve_dislocations_matches_contango_backwardation_and_ties() -> N
     assert dislocations.tolist() == [0, 6, 2, 6]
 
 
+def test_count_curve_dislocations_supports_stable_tie_handling() -> None:
+    curve = make_curve(
+        [
+            [1, 2, 3, 4, 5, 5, 7],
+            [5, 5, 5, 5, 5, 5, 5],
+            [2, 1, 3, 4, 5, 6, 7],
+        ]
+    )
+
+    strict = count_curve_dislocations(curve)
+    stable = count_curve_dislocations(curve, tie_policy="stable_order")
+
+    assert strict.tolist() == [1, 6, 2]
+    assert stable.tolist() == [0, 0, 2]
+
+
 def test_build_daily_signal_frame_shifts_signal_one_day() -> None:
     signal_curve = make_curve(
         [
@@ -140,6 +158,25 @@ def test_build_daily_signal_frame_shifts_signal_one_day() -> None:
     )
     assert signal_frame.loc[pd.Timestamp("2024-01-04"), "vix_close_signal"] == pytest.approx(
         35.0
+    )
+
+
+def test_build_daily_signal_frame_accepts_stable_tie_policy() -> None:
+    signal_curve = make_curve(
+        [
+            [1, 2, 3, 4, 5, 5, 7],
+            [2, 1, 3, 4, 5, 6, 7],
+        ]
+    )
+
+    signal_frame = build_daily_signal_frame(signal_curve, tie_policy="stable_order")
+
+    assert signal_frame.loc[pd.Timestamp("2024-01-02"), "dislocation_count_raw"] == 0
+    assert signal_frame.loc[pd.Timestamp("2024-01-02"), "dislocation_bucket_raw"] == (
+        "Perfect Contango (0)"
+    )
+    assert signal_frame.loc[pd.Timestamp("2024-01-03"), "es_weight_signal"] == pytest.approx(
+        1.0
     )
 
 
@@ -407,6 +444,69 @@ def test_build_generic_return_frame_pivots_selected_return_field() -> None:
     assert pd.isna(returns.loc[pd.Timestamp("2024-01-03"), "UX3"])
 
 
+def test_build_available_contract_frame_selects_nth_available_contracts() -> None:
+    generic_frame = pd.DataFrame(
+        [
+            {
+                "trade_date": "2024-01-02",
+                "ux_symbol": "UX1",
+                "ux_rank": 1,
+                "contract_expiry": "2024-01-17",
+                "net_return": 0.01,
+            },
+            {
+                "trade_date": "2024-01-02",
+                "ux_symbol": "UX2",
+                "ux_rank": 2,
+                "contract_expiry": "2024-02-14",
+                "net_return": 0.02,
+            },
+            {
+                "trade_date": "2024-01-02",
+                "ux_symbol": "UX4",
+                "ux_rank": 4,
+                "contract_expiry": "2024-04-17",
+                "net_return": 0.04,
+            },
+            {
+                "trade_date": "2024-01-03",
+                "ux_symbol": "UX1",
+                "ux_rank": 1,
+                "contract_expiry": "2024-01-17",
+                "net_return": 0.011,
+            },
+            {
+                "trade_date": "2024-01-03",
+                "ux_symbol": "UX3",
+                "ux_rank": 3,
+                "contract_expiry": "2024-03-20",
+                "net_return": 0.03,
+            },
+            {
+                "trade_date": "2024-01-03",
+                "ux_symbol": "UX4",
+                "ux_rank": 4,
+                "contract_expiry": "2024-04-17",
+                "net_return": 0.041,
+            },
+        ]
+    )
+
+    available = build_available_contract_frame(
+        generic_frame,
+        value_field="net_return",
+        contract_positions={"UX1": 1, "UX3": 3},
+        start="2024-01-02",
+        end="2024-01-03",
+    )
+
+    assert list(available.columns) == ["UX1", "UX3"]
+    assert available.loc[pd.Timestamp("2024-01-02"), "UX1"] == pytest.approx(0.01)
+    assert available.loc[pd.Timestamp("2024-01-02"), "UX3"] == pytest.approx(0.04)
+    assert available.loc[pd.Timestamp("2024-01-03"), "UX1"] == pytest.approx(0.011)
+    assert available.loc[pd.Timestamp("2024-01-03"), "UX3"] == pytest.approx(0.041)
+
+
 def test_build_return_frame_from_levels_respects_missing_levels() -> None:
     levels = pd.DataFrame(
         {
@@ -514,6 +614,87 @@ def test_build_turnover_series_uses_one_way_absolute_weight_change() -> None:
     assert turnover.iloc[2] == pytest.approx(0.25)
 
 
+def test_build_turnover_series_can_report_full_traded_notional() -> None:
+    weights = pd.DataFrame(
+        {
+            "weight_es": [None, 0.5, 0.25],
+            "weight_spvxtstr": [None, 0.5, 0.75],
+        },
+        index=pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+    )
+
+    turnover = build_turnover_series(
+        weights,
+        weight_columns=["weight_es", "weight_spvxtstr"],
+        one_way=False,
+    )
+
+    assert pd.isna(turnover.iloc[0])
+    assert pd.isna(turnover.iloc[1])
+    assert turnover.iloc[2] == pytest.approx(0.5)
+
+
+def test_build_strategy_transaction_costs_charges_absolute_rebalances_and_rolls() -> None:
+    index = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+    weights = pd.DataFrame(
+        {
+            "weight_es": [None, 0.5, 0.25],
+            "weight_ux1": [None, -0.25, -0.375],
+            "weight_ux3": [None, 0.5, 0.75],
+        },
+        index=index,
+    )
+    roll_costs = pd.DataFrame(
+        {
+            "UX1": [0.0, 0.0, 0.0002],
+            "UX3": [0.0, 0.0002, 0.0],
+        },
+        index=index,
+    )
+
+    costs = build_strategy_transaction_costs(
+        weights,
+        weight_columns=["weight_es", "weight_ux1", "weight_ux3"],
+        roll_costs=roll_costs,
+        roll_weight_map={"UX1": "weight_ux1", "UX3": "weight_ux3"},
+        transaction_cost_bps=2.0,
+    )
+
+    expected_rebalance_cost = (0.25 + 0.125 + 0.25) * 0.0002
+    expected_roll_cost = 0.375 * 0.0002
+    assert pd.isna(costs.iloc[0])
+    assert costs.iloc[1] == pytest.approx(0.0)
+    assert costs.iloc[2] == pytest.approx(expected_rebalance_cost + expected_roll_cost)
+
+
+def test_combine_weighted_returns_subtracts_transaction_costs() -> None:
+    index = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    asset_returns = pd.DataFrame(
+        {"ES": [0.01, 0.02], "UX1": [-0.03, 0.01], "UX3": [0.04, 0.03]},
+        index=index,
+    )
+    weights = pd.DataFrame(
+        {
+            "weight_es": [0.5, 0.25],
+            "weight_ux1": [-0.25, -0.375],
+            "weight_ux3": [0.5, 0.75],
+        },
+        index=index,
+    )
+    transaction_costs = pd.Series([0.0, 0.0003], index=index)
+
+    strategy_returns = combine_weighted_returns(
+        asset_returns,
+        weights,
+        asset_weight_map={"ES": "weight_es", "UX1": "weight_ux1", "UX3": "weight_ux3"},
+        transaction_costs=transaction_costs,
+        name="strategy_return",
+    )
+
+    gross_return = 0.25 * 0.02 + (-0.375) * 0.01 + 0.75 * 0.03
+    assert strategy_returns.iloc[1] == pytest.approx(gross_return - 0.0003)
+
+
 def test_summarize_performance_reports_core_metrics_and_turnover() -> None:
     returns = pd.Series(
         [0.10, -0.05, 0.02],
@@ -538,3 +719,14 @@ def test_summarize_performance_reports_core_metrics_and_turnover() -> None:
     assert summary["sharpe_ratio"] == pytest.approx(expected_ann_return / expected_ann_vol)
     assert summary["sortino_ratio"] == pytest.approx(expected_ann_return / expected_sortino_denominator)
     assert summary["turnover"] == pytest.approx(0.15)
+
+
+def test_summarize_performance_handles_nullable_single_observation() -> None:
+    returns = pd.Series([0.01], index=pd.to_datetime(["2024-01-03"]), dtype="Float64")
+
+    summary = summarize_performance(returns, annualization=1)
+
+    assert summary["annualized_return"] == pytest.approx(0.01)
+    assert pd.isna(summary["annualized_volatility"])
+    assert pd.isna(summary["sharpe_ratio"])
+    assert pd.isna(summary["sortino_ratio"])
